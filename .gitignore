@@ -1,0 +1,27 @@
+# Virtual environment
+myenv/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data files
+*.npy
+
+# MediaPipe pretrained models
+*.task
+
+# Trained model checkpoints
+*.pth
+*.pt
+
+# OS/editor junk
+.DS_Store
+Thumbs.db
+.vscode/
