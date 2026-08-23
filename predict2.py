@@ -10,6 +10,7 @@ from collections import deque, Counter
 
 import clip
 from PIL import Image
+import time
 
 # ── Config ───────────────────────────────────────────────────
 FIXED_LEN   = 100
@@ -239,7 +240,60 @@ top3_preds   = []
 frame_count  = 0
 timestamp    = 0
 pred_history = deque(maxlen=5)
-MIN_FRAMES   = 30
+
+# ── Dynamic sliding window config ──────────────────────────────
+MIN_FRAMES          = 20     # don't predict before this many real frames
+MAX_FRAMES          = 80     # force a commit if we hit this without confidence
+CHECK_INTERVAL      = 5      # how often (in frames) to re-check confidence
+
+# Confidence threshold decays from START_THRESH (strict, early in window)
+# down to END_THRESH (lenient, near MAX_FRAMES) — see get_dynamic_threshold()
+START_THRESH = 0.90
+END_THRESH   = 0.55
+
+# ── Motion-based pause detection (segmentation) ─────────────────
+VELOCITY_THRESH    = 0.004   # sane starting default — tune this evening with DEBUG_VELOCITY
+WORD_PAUSE_SEC     = 0.2     # stillness that marks end of a WORD (per your test)
+SENTENCE_PAUSE_SEC = 0.4     # stillness that marks end of a SENTENCE (per your test)
+DEBUG_VELOCITY     = False   # set True to print raw velocity values while tuning
+
+last_movement_time = time.time()
+
+# ── Sentence recording ───────────────────────────────────────────
+SENTENCE_LOG_PATH  = "detected_sentences.txt"   # change to a full path if you prefer
+sentence_words      = []    # words committed so far in the CURRENT sentence
+sentence_finalized  = False # guards against logging the same pause repeatedly
+
+
+def log_sentence(words):
+    """Append one finished sentence (space-joined words) as a new line."""
+    if not words:
+        return
+    line = " ".join(words)
+    with open(SENTENCE_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+    print(f"📝 Sentence logged: {line}")
+
+
+def get_dynamic_threshold(current_len, min_frames, max_frames,
+                           start_thresh=START_THRESH, end_thresh=END_THRESH):
+    """Linearly relax the confidence bar as the window grows."""
+    if current_len <= min_frames:
+        return start_thresh
+    progress = (current_len - min_frames) / (max_frames - min_frames)
+    progress = min(progress, 1.0)
+    return start_thresh - progress * (start_thresh - end_thresh)
+
+
+def hand_velocity(prev_landmarks, curr_landmarks):
+    """
+    Mean per-point displacement between two feature vectors.
+    Only look at the hand portion (last 126 dims = left+right hand, 165:291),
+    since pose can jitter from body sway without the person actively signing.
+    """
+    prev_hands = prev_landmarks[165:]
+    curr_hands = curr_landmarks[165:]
+    return float(np.mean(np.abs(curr_hands - prev_hands)))
 
 print("✅ Camera opened!")
 print("Press SPACE to reset | Press Q to quit")
@@ -266,14 +320,54 @@ while True:
 
     draw_landmarks(frame, hand_result, pose_result)
 
-    if (frame_count % 25 == 0 and
-        len(buffer) >= MIN_FRAMES and
-        hand_detected):
+    # ── Track motion → detect stillness/pauses (every frame) ────
+    if len(buffer) >= 2:
+        v = hand_velocity(buffer[-2], buffer[-1])
+        if DEBUG_VELOCITY and frame_count % 3 == 0:
+            print(f"velocity: {v:.5f}")
+        if v > VELOCITY_THRESH:
+            last_movement_time = time.time()
+            sentence_finalized = False   # real movement resumed → allow next sentence to log later
+
+    stillness        = time.time() - last_movement_time
+    word_paused      = stillness >= WORD_PAUSE_SEC
+    sentence_paused  = stillness >= SENTENCE_PAUSE_SEC
+
+    # ── Sentence finalize: fires once per stillness period ──────
+    if sentence_paused and sentence_words and not sentence_finalized:
+        log_sentence(sentence_words)
+        sentence_words = []
+        sentence_finalized = True
+
+    should_check = (frame_count % CHECK_INTERVAL == 0) or word_paused
+
+    if hand_detected and len(buffer) >= MIN_FRAMES and should_check:
         sign, conf, top3 = predict(buffer)
         pred_history.append(sign)
         predicted  = Counter(pred_history).most_common(1)[0][0]
         confidence = conf
         top3_preds = top3
+
+        threshold          = get_dynamic_threshold(len(buffer), MIN_FRAMES, MAX_FRAMES)
+        confident_enough   = (conf / 100.0) >= threshold
+        window_maxed_out   = len(buffer) >= MAX_FRAMES
+
+        if confident_enough or word_paused or window_maxed_out:
+            if word_paused:
+                reason = "word pause"
+            elif confident_enough:
+                reason = "confident"
+            else:
+                reason = "max window reached"
+
+            print(f"✅ Committed '{predicted}' ({confidence:.1f}%) — {reason}, "
+                  f"window={len(buffer)} frames")
+
+            sentence_words.append(predicted)
+
+            # Reset so the NEXT sign starts on a clean window
+            buffer.clear()
+            pred_history.clear()
 
     elif not hand_detected and len(buffer) < MIN_FRAMES:
         predicted  = "Show a sign..."
@@ -334,17 +428,46 @@ while True:
                        cv2.FONT_HERSHEY_SIMPLEX,
                        0.5, (180,180,180), 1)
 
+    # ── Sentence-in-progress overlay ─────────────────────────
+    if sentence_words:
+        sentence_preview = " ".join(sentence_words)
+        cv2.rectangle(frame, (0, h-60), (w, h-32), (0,0,0), -1)
+        cv2.putText(frame, f"Sentence: {sentence_preview}",
+                   (10, h-40), cv2.FONT_HERSHEY_SIMPLEX,
+                   0.6, (0,255,150), 2)
+
     hand_color = (0,255,0) if hand_detected else (0,0,255)
     cv2.putText(frame,
-               f"Hand:{'ON' if hand_detected else 'OFF'} | Buf:{len(buffer)}/{FIXED_LEN}",
+               f"Hand:{'ON' if hand_detected else 'OFF'} | Buf:{len(buffer)}/{MAX_FRAMES}",
                (10, h-10),
                cv2.FONT_HERSHEY_SIMPLEX,
                0.55, hand_color, 1)
+
+    # ── Sliding window progress bar ─────────────────────────
+    bar_x, bar_y   = 10, h - 30
+    bar_w, bar_h   = 200, 12
+    fill_ratio = min(len(buffer) / MAX_FRAMES, 1.0)
+    fill_w     = int(bar_w * fill_ratio)
+
+    # zone markers: below MIN_FRAMES = red-ish, MIN..MAX = growing (yellow->green)
+    if len(buffer) < MIN_FRAMES:
+        bar_color = (0, 0, 200)       # not enough context yet
+    elif confidence / 100.0 >= get_dynamic_threshold(len(buffer), MIN_FRAMES, MAX_FRAMES):
+        bar_color = (0, 220, 0)       # confident, about to commit
+    else:
+        bar_color = (0, 200, 220)     # growing, waiting for confidence
+
+    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (60,60,60), -1)
+    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h), bar_color, -1)
+    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (150,150,150), 1)
 
     cv2.imshow("NSL Sign Recognition v2 — Q:quit SPACE:reset", frame)
 
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'):
+        if sentence_words:
+            log_sentence(sentence_words)   # flush unfinished sentence on quit
+            sentence_words = []
         break
     elif key == ord(' '):
         buffer.clear()
@@ -359,5 +482,3 @@ cv2.destroyAllWindows()
 hand_landmarker.close()
 pose_landmarker.close()
 print("✅ Done")
-
-
