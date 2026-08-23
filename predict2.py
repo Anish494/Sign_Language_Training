@@ -8,6 +8,9 @@ from mediapipe.tasks.python import vision
 from model2 import SignLanguageTransformer
 from collections import deque, Counter
 
+import clip
+from PIL import Image
+
 # ── Config ───────────────────────────────────────────────────
 FIXED_LEN   = 100
 FEAT_DIM    = 291
@@ -38,6 +41,39 @@ model.load_state_dict(torch.load(
 ))
 model.eval()
 print("✅ Model loaded!")
+
+
+# ── Load CLIP ─────────────────────────────────────────────────
+print("Loading CLIP...")
+model_clip, preprocess_clip = clip.load("ViT-B/32", device=DEVICE)
+model_clip.eval()
+
+SCENES = [
+    "a hospital room or medical facility",
+    "a classroom or school environment",
+    "a home living room",
+    "an outdoor street or public place",
+    "an office or workplace",
+    "a kitchen or dining area",
+    "a shop or market",
+    "a library or study room",
+    "a pharmacy or medical shop",
+    "a waiting room or reception area",
+    "a restaurant or cafe",
+    "a community center or gathering place",
+]
+
+# Encode text ONCE — not every frame
+text_tokens = clip.tokenize(SCENES).to(DEVICE)
+with torch.no_grad():
+    text_features = model_clip.encode_text(text_tokens)
+    text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+print("✅ CLIP loaded!")
+
+# Scene state variables
+current_scene    = "Detecting scene..."
+scene_confidence = 0.0
 
 # ── Setup MediaPipe new API ───────────────────────────────────
 hand_base    = python.BaseOptions(
@@ -164,6 +200,36 @@ def draw_landmarks(frame, hand_result, pose_result):
                 x2,y2 = int(hand[e].x*w), int(hand[e].y*h)
                 cv2.line(frame, (x1,y1), (x2,y2), (0,0,255), 2)
 
+
+def detect_scene(frame):
+    """
+    Run CLIP on current frame to detect environment
+    Returns: scene name (short), confidence %
+    """
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    pil_image = Image.fromarray(frame_rgb)
+
+    image_input = preprocess_clip(pil_image).unsqueeze(0).to(DEVICE)
+
+    with torch.no_grad():
+        image_features = model_clip.encode_image(image_input)
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+
+    similarity = (image_features @ text_features.T).squeeze(0)
+    probs      = torch.softmax(similarity * 100, dim=0)
+
+    best_idx  = probs.argmax().item()
+    best_prob = probs[best_idx].item() * 100
+
+    # Shorten scene name for display
+    full_scene = SCENES[best_idx]
+    short_scene = full_scene.split(" or ")[0]  # take first part
+    short_scene = short_scene.replace("a ", "").replace("an ", "").title()
+
+    return short_scene, best_prob
+
+
+
 # ── Main Loop ─────────────────────────────────────────────────
 cap          = cv2.VideoCapture(0)
 buffer       = deque(maxlen=FIXED_LEN)
@@ -185,6 +251,9 @@ while True:
 
     frame_count += 1
     timestamp   += 1
+    # Run CLIP every 30 frames (not every frame — too slow)
+    if frame_count % 30 == 0:
+        current_scene, scene_confidence = detect_scene(frame)
 
     landmarks, hand_result, pose_result, hand_detected = \
         extract_landmarks(frame, timestamp)
@@ -213,6 +282,36 @@ while True:
         pred_history.clear()
 
     h, w, _ = frame.shape
+        # Background box top right
+    box_w = 280
+    box_h = 70
+    cv2.rectangle(frame,
+                (w - box_w - 10, 5),
+                (w - 10, box_h),
+                (0, 0, 0), -1)
+    cv2.rectangle(frame,
+                (w - box_w - 10, 5),
+                (w - 10, box_h),
+                (50, 50, 50), 2)
+
+    # Scene label
+    cv2.putText(frame,
+            "Scene:",
+            (w - box_w, 25),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55, (200, 200, 200), 1)
+
+    cv2.putText(frame,
+            f"{current_scene}",
+            (w - box_w, 48),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8, (0, 255, 255), 2)
+
+    cv2.putText(frame,
+            f"{scene_confidence:.1f}%",
+            (w - box_w, 65),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55, (180, 180, 180), 1)
 
     cv2.rectangle(frame, (0,0), (340,200), (0,0,0), -1)
     cv2.rectangle(frame, (0,0), (340,200), (50,50,50), 2)
@@ -260,3 +359,5 @@ cv2.destroyAllWindows()
 hand_landmarker.close()
 pose_landmarker.close()
 print("✅ Done")
+
+
