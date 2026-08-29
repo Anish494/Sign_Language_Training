@@ -7,7 +7,6 @@ from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 from model2 import SignLanguageTransformer
 from collections import deque, Counter
-
 import clip
 from PIL import Image
 import time
@@ -23,13 +22,29 @@ NUM_HAND_LANDMARKS = 21
 POSE_DIMS = 5
 HAND_DIMS = 3
 
+# ── Dynamic sliding window config ────────────────────────────
+MIN_FRAMES     = 20      # minimum frames before predicting
+MAX_FRAMES     = 80      # force commit at this window size
+CHECK_INTERVAL = 5       # check confidence every N frames
+START_THRESH   = 0.90    # confidence threshold at MIN_FRAMES
+END_THRESH     = 0.55    # confidence threshold at MAX_FRAMES
+
+# ── Motion / pause detection config ──────────────────────────
+VELOCITY_THRESH    = 0.004  # minimum hand motion to count as signing
+WORD_PAUSE_SEC     = 0.4    # stillness = end of one word
+SENTENCE_PAUSE_SEC = 1.0    # stillness = end of sentence → clear screen
+DEBUG_VELOCITY     = False  # set True to print velocity values
+
+# ── Sentence log ──────────────────────────────────────────────
+SENTENCE_LOG_PATH = "detected_sentences.txt"
+
 # ── Load sign labels ─────────────────────────────────────────
 with open(r"E:\Sign_Train_First\class_mapping.json") as f:
     sign_to_idx = json.load(f)
 idx_to_sign = {v: k for k, v in sign_to_idx.items()}
 print(f"✅ Loaded {len(sign_to_idx)} signs")
 
-# ── Load model ───────────────────────────────────────────────
+# ── Load Transformer model ────────────────────────────────────
 model = SignLanguageTransformer(
     input_dim   = FEAT_DIM,
     num_classes = NUM_CLASSES,
@@ -42,7 +57,6 @@ model.load_state_dict(torch.load(
 ))
 model.eval()
 print("✅ Model loaded!")
-
 
 # ── Load CLIP ─────────────────────────────────────────────────
 print("Loading CLIP...")
@@ -64,7 +78,7 @@ SCENES = [
     "a community center or gathering place",
 ]
 
-# Encode text ONCE — not every frame
+# Encode text ONCE at startup
 text_tokens = clip.tokenize(SCENES).to(DEVICE)
 with torch.no_grad():
     text_features = model_clip.encode_text(text_tokens)
@@ -72,11 +86,7 @@ with torch.no_grad():
 
 print("✅ CLIP loaded!")
 
-# Scene state variables
-current_scene    = "Detecting scene..."
-scene_confidence = 0.0
-
-# ── Setup MediaPipe new API ───────────────────────────────────
+# ── Setup MediaPipe ───────────────────────────────────────────
 hand_base    = python.BaseOptions(
     model_asset_path=r"E:\Sign_Train_First\hand_landmarker.task")
 hand_options = vision.HandLandmarkerOptions(
@@ -102,11 +112,8 @@ print("✅ MediaPipe loaded!")
 # ── Landmark extraction ───────────────────────────────────────
 def extract_landmarks(frame, timestamp):
     """
-    Extract 291-dim feature — SAME ORDER as training:
-    pose(165) + left_hand(63) + right_hand(63) = 291
-    
-    Note: training used visibility+presence from mp.solutions.holistic
-    We simulate this with new API (visibility available, presence=0)
+    Extract 291-dim feature vector.
+    Order MUST match training: pose(165) + left_hand(63) + right_hand(63)
     """
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     mp_image  = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
@@ -114,7 +121,7 @@ def extract_landmarks(frame, timestamp):
     hand_result = hand_landmarker.detect_for_video(mp_image, timestamp)
     pose_result = pose_landmarker.detect_for_video(mp_image, timestamp)
 
-    # ── Pose: 33 × 5 = 165 (x,y,z,visibility,presence) ──────
+    # Pose: 33 × 5 = 165
     pose = np.zeros((NUM_POSE_LANDMARKS, POSE_DIMS), dtype=np.float32)
     if pose_result.pose_landmarks:
         for i, lm in enumerate(pose_result.pose_landmarks[0]):
@@ -124,7 +131,7 @@ def extract_landmarks(frame, timestamp):
                 getattr(lm, 'presence', 0.0)
             ]
 
-    # ── Hands: 21 × 3 = 63 each ──────────────────────────────
+    # Hands: 21 × 3 = 63 each
     left_hand  = np.zeros((NUM_HAND_LANDMARKS, HAND_DIMS), dtype=np.float32)
     right_hand = np.zeros((NUM_HAND_LANDMARKS, HAND_DIMS), dtype=np.float32)
 
@@ -138,18 +145,17 @@ def extract_landmarks(frame, timestamp):
             else:
                 right_hand = coords
 
-    # ── Concatenate in SAME ORDER as training ─────────────────
     feature = np.concatenate([
-        pose.flatten(),        # 165 FIRST
-        left_hand.flatten(),   # 63  SECOND
-        right_hand.flatten()   # 63  THIRD
+        pose.flatten(),        # 165 — FIRST (matches training)
+        left_hand.flatten(),   # 63  — SECOND
+        right_hand.flatten()   # 63  — THIRD
     ])
 
     hand_detected = len(hand_result.hand_landmarks) > 0
-
     return feature, hand_result, pose_result, hand_detected
 
-# ── Predict ───────────────────────────────────────────────────
+
+# ── Transformer prediction ────────────────────────────────────
 def predict(buffer):
     actual_len = min(len(buffer), FIXED_LEN)
     seq = np.array(list(buffer)[-actual_len:], dtype=np.float32)
@@ -162,8 +168,8 @@ def predict(buffer):
     length_t = torch.LongTensor([actual_len]).to(DEVICE)
 
     with torch.no_grad():
-        output   = model(seq_t, length_t)
-        probs    = torch.softmax(output, dim=1)
+        output = model(seq_t, length_t)
+        probs  = torch.softmax(output, dim=1)
         conf, pred_idx = torch.max(probs, dim=1)
         top3_probs, top3_idx = torch.topk(probs, 3, dim=1)
 
@@ -172,6 +178,30 @@ def predict(buffer):
             for i in range(3)]
 
     return idx_to_sign[pred_idx.item()], conf.item() * 100, top3
+
+
+# ── CLIP scene detection ──────────────────────────────────────
+def detect_scene(frame):
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    pil_image = Image.fromarray(frame_rgb)
+    image_input = preprocess_clip(pil_image).unsqueeze(0).to(DEVICE)
+
+    with torch.no_grad():
+        image_features = model_clip.encode_image(image_input)
+        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+
+    similarity = (image_features @ text_features.T).squeeze(0)
+    probs      = torch.softmax(similarity * 100, dim=0)
+
+    best_idx  = probs.argmax().item()
+    best_prob = probs[best_idx].item() * 100
+
+    full_scene  = SCENES[best_idx]
+    short_scene = full_scene.split(" or ")[0]
+    short_scene = short_scene.replace("a ", "").replace("an ", "").title()
+
+    return short_scene, best_prob
+
 
 # ── Draw landmarks ────────────────────────────────────────────
 HAND_CONNECTIONS = [
@@ -185,88 +215,39 @@ HAND_CONNECTIONS = [
 
 def draw_landmarks(frame, hand_result, pose_result):
     h, w, _ = frame.shape
-
     if pose_result.pose_landmarks:
         for lm in pose_result.pose_landmarks[0]:
             cx, cy = int(lm.x * w), int(lm.y * h)
             cv2.circle(frame, (cx, cy), 3, (255, 255, 0), -1)
-
     if hand_result.hand_landmarks:
         for hand in hand_result.hand_landmarks:
             for lm in hand:
                 cx, cy = int(lm.x * w), int(lm.y * h)
                 cv2.circle(frame, (cx, cy), 5, (0, 255, 0), -1)
             for s, e in HAND_CONNECTIONS:
-                x1,y1 = int(hand[s].x*w), int(hand[s].y*h)
-                x2,y2 = int(hand[e].x*w), int(hand[e].y*h)
+                x1, y1 = int(hand[s].x * w), int(hand[s].y * h)
+                x2, y2 = int(hand[e].x * w), int(hand[e].y * h)
                 cv2.line(frame, (x1,y1), (x2,y2), (0,0,255), 2)
 
 
-def detect_scene(frame):
-    """
-    Run CLIP on current frame to detect environment
-    Returns: scene name (short), confidence %
-    """
-    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    pil_image = Image.fromarray(frame_rgb)
-
-    image_input = preprocess_clip(pil_image).unsqueeze(0).to(DEVICE)
-
-    with torch.no_grad():
-        image_features = model_clip.encode_image(image_input)
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-
-    similarity = (image_features @ text_features.T).squeeze(0)
-    probs      = torch.softmax(similarity * 100, dim=0)
-
-    best_idx  = probs.argmax().item()
-    best_prob = probs[best_idx].item() * 100
-
-    # Shorten scene name for display
-    full_scene = SCENES[best_idx]
-    short_scene = full_scene.split(" or ")[0]  # take first part
-    short_scene = short_scene.replace("a ", "").replace("an ", "").title()
-
-    return short_scene, best_prob
+# ── Dynamic threshold ─────────────────────────────────────────
+def get_dynamic_threshold(current_len):
+    if current_len <= MIN_FRAMES:
+        return START_THRESH
+    progress = (current_len - MIN_FRAMES) / (MAX_FRAMES - MIN_FRAMES)
+    progress = min(progress, 1.0)
+    return START_THRESH - progress * (START_THRESH - END_THRESH)
 
 
-
-# ── Main Loop ─────────────────────────────────────────────────
-cap          = cv2.VideoCapture(0)
-buffer       = deque(maxlen=FIXED_LEN)
-predicted    = "Show a sign..."
-confidence   = 0.0
-top3_preds   = []
-frame_count  = 0
-timestamp    = 0
-pred_history = deque(maxlen=5)
-
-# ── Dynamic sliding window config ──────────────────────────────
-MIN_FRAMES          = 20     # don't predict before this many real frames
-MAX_FRAMES          = 80     # force a commit if we hit this without confidence
-CHECK_INTERVAL      = 5      # how often (in frames) to re-check confidence
-
-# Confidence threshold decays from START_THRESH (strict, early in window)
-# down to END_THRESH (lenient, near MAX_FRAMES) — see get_dynamic_threshold()
-START_THRESH = 0.90
-END_THRESH   = 0.55
-
-# ── Motion-based pause detection (segmentation) ─────────────────
-VELOCITY_THRESH    = 0.004   # sane starting default — tune this evening with DEBUG_VELOCITY
-WORD_PAUSE_SEC     = 0.2     # stillness that marks end of a WORD (per your test)
-SENTENCE_PAUSE_SEC = 0.4     # stillness that marks end of a SENTENCE (per your test)
-DEBUG_VELOCITY     = False   # set True to print raw velocity values while tuning
-
-last_movement_time = time.time()
-
-# ── Sentence recording ───────────────────────────────────────────
-SENTENCE_LOG_PATH  = "detected_sentences.txt"   # change to a full path if you prefer
-sentence_words      = []    # words committed so far in the CURRENT sentence
-sentence_finalized  = False # guards against logging the same pause repeatedly
+# ── Hand velocity ─────────────────────────────────────────────
+def hand_velocity(prev_landmarks, curr_landmarks):
+    prev_hands = prev_landmarks[165:]
+    curr_hands = curr_landmarks[165:]
+    return float(np.mean(np.abs(curr_hands - prev_hands)))
 
 
+# ── Log sentence ──────────────────────────────────────────────
 def log_sentence(words):
-    """Append one finished sentence (space-joined words) as a new line."""
     if not words:
         return
     line = " ".join(words)
@@ -275,28 +256,30 @@ def log_sentence(words):
     print(f"📝 Sentence logged: {line}")
 
 
-def get_dynamic_threshold(current_len, min_frames, max_frames,
-                           start_thresh=START_THRESH, end_thresh=END_THRESH):
-    """Linearly relax the confidence bar as the window grows."""
-    if current_len <= min_frames:
-        return start_thresh
-    progress = (current_len - min_frames) / (max_frames - min_frames)
-    progress = min(progress, 1.0)
-    return start_thresh - progress * (start_thresh - end_thresh)
+# ── State variables ───────────────────────────────────────────
+cap               = cv2.VideoCapture(0)
+buffer            = deque(maxlen=FIXED_LEN)
+predicted         = "Show a sign..."
+confidence        = 0.0
+top3_preds        = []
+frame_count       = 0
+timestamp         = 0
+pred_history      = deque(maxlen=5)
+current_scene     = "Detecting..."
+scene_confidence  = 0.0
+last_movement_time = time.time()
+sentence_finalized = False
 
-
-def hand_velocity(prev_landmarks, curr_landmarks):
-    """
-    Mean per-point displacement between two feature vectors.
-    Only look at the hand portion (last 126 dims = left+right hand, 165:291),
-    since pose can jitter from body sway without the person actively signing.
-    """
-    prev_hands = prev_landmarks[165:]
-    curr_hands = curr_landmarks[165:]
-    return float(np.mean(np.abs(curr_hands - prev_hands)))
+# ── Sentence state ────────────────────────────────────────────
+# Stores unique consecutive words
+# Same word won't be added twice in a row
+# Cleared after SENTENCE_PAUSE_SEC of stillness
+sentence_words = []   # list of committed unique words
+last_committed = None # last word added to sentence
 
 print("✅ Camera opened!")
-print("Press SPACE to reset | Press Q to quit")
+print("Controls: SPACE = reset | Q = quit")
+print(f"Sentence clears after {SENTENCE_PAUSE_SEC}s stillness")
 
 while True:
     ret, frame = cap.read()
@@ -305,40 +288,47 @@ while True:
 
     frame_count += 1
     timestamp   += 1
-    # Run CLIP every 30 frames (not every frame — too slow)
+
+    # ── CLIP every 30 frames ─────────────────────────────────
     if frame_count % 30 == 0:
         current_scene, scene_confidence = detect_scene(frame)
 
+    # ── Extract landmarks ─────────────────────────────────────
     landmarks, hand_result, pose_result, hand_detected = \
         extract_landmarks(frame, timestamp)
 
+    # Fill or drain buffer based on hand detection
     if hand_detected:
         buffer.append(landmarks)
     else:
         if len(buffer) > 0:
             buffer.popleft()
 
+    # ── Draw skeleton ─────────────────────────────────────────
     draw_landmarks(frame, hand_result, pose_result)
 
-    # ── Track motion → detect stillness/pauses (every frame) ────
+    # ── Motion tracking ───────────────────────────────────────
     if len(buffer) >= 2:
         v = hand_velocity(buffer[-2], buffer[-1])
         if DEBUG_VELOCITY and frame_count % 3 == 0:
             print(f"velocity: {v:.5f}")
         if v > VELOCITY_THRESH:
             last_movement_time = time.time()
-            sentence_finalized = False   # real movement resumed → allow next sentence to log later
+            sentence_finalized = False
 
-    stillness        = time.time() - last_movement_time
-    word_paused      = stillness >= WORD_PAUSE_SEC
-    sentence_paused  = stillness >= SENTENCE_PAUSE_SEC
+    stillness       = time.time() - last_movement_time
+    word_paused     = stillness >= WORD_PAUSE_SEC
+    sentence_paused = stillness >= SENTENCE_PAUSE_SEC
 
-    # ── Sentence finalize: fires once per stillness period ──────
+    # ── Sentence clear on long pause ─────────────────────────
+    # When still for SENTENCE_PAUSE_SEC → log and clear sentence
     if sentence_paused and sentence_words and not sentence_finalized:
         log_sentence(sentence_words)
-        sentence_words = []
+        sentence_words  = []
+        last_committed  = None
         sentence_finalized = True
 
+    # ── Prediction ────────────────────────────────────────────
     should_check = (frame_count % CHECK_INTERVAL == 0) or word_paused
 
     if hand_detected and len(buffer) >= MIN_FRAMES and should_check:
@@ -348,24 +338,30 @@ while True:
         confidence = conf
         top3_preds = top3
 
-        threshold          = get_dynamic_threshold(len(buffer), MIN_FRAMES, MAX_FRAMES)
-        confident_enough   = (conf / 100.0) >= threshold
-        window_maxed_out   = len(buffer) >= MAX_FRAMES
+        threshold        = get_dynamic_threshold(len(buffer))
+        confident_enough = (conf / 100.0) >= threshold
+        window_maxed     = len(buffer) >= MAX_FRAMES
 
-        if confident_enough or word_paused or window_maxed_out:
-            if word_paused:
-                reason = "word pause"
-            elif confident_enough:
-                reason = "confident"
-            else:
-                reason = "max window reached"
+        # Commit word when confident, paused, or window maxed
+        if confident_enough or word_paused or window_maxed:
+            if word_paused:     reason = "word pause"
+            elif confident_enough: reason = "confident"
+            else:               reason = "max window"
 
-            print(f"✅ Committed '{predicted}' ({confidence:.1f}%) — {reason}, "
-                  f"window={len(buffer)} frames")
+            print(f"✅ '{predicted}' ({confidence:.1f}%) — {reason}, "
+                  f"window={len(buffer)}")
 
-            sentence_words.append(predicted)
+            # ── Add to sentence only if different from last word ──
+            # This prevents "ghar ghar ghar" duplicates
+            if predicted != last_committed and predicted != "Show a sign...":
+                sentence_words.append(predicted)
+                last_committed = predicted
 
-            # Reset so the NEXT sign starts on a clean window
+                # Keep only last 5 words visible
+                if len(sentence_words) > 5:
+                    sentence_words.pop(0)
+
+            # Reset buffer for next sign
             buffer.clear()
             pred_history.clear()
 
@@ -375,108 +371,122 @@ while True:
         top3_preds = []
         pred_history.clear()
 
+    # ══════════════════════════════════════════════════════════
+    # DISPLAY
+    # ══════════════════════════════════════════════════════════
     h, w, _ = frame.shape
-        # Background box top right
-    box_w = 280
-    box_h = 70
-    cv2.rectangle(frame,
-                (w - box_w - 10, 5),
-                (w - 10, box_h),
-                (0, 0, 0), -1)
-    cv2.rectangle(frame,
-                (w - box_w - 10, 5),
-                (w - 10, box_h),
-                (50, 50, 50), 2)
 
-    # Scene label
-    cv2.putText(frame,
-            "Scene:",
-            (w - box_w, 25),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55, (200, 200, 200), 1)
-
-    cv2.putText(frame,
-            f"{current_scene}",
-            (w - box_w, 48),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.8, (0, 255, 255), 2)
-
-    cv2.putText(frame,
-            f"{scene_confidence:.1f}%",
-            (w - box_w, 65),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55, (180, 180, 180), 1)
-
-    cv2.rectangle(frame, (0,0), (340,200), (0,0,0), -1)
-    cv2.rectangle(frame, (0,0), (340,200), (50,50,50), 2)
+    # ── Top LEFT — current sign prediction ───────────────────
+    cv2.rectangle(frame, (0,0), (340, 200), (0,0,0), -1)
+    cv2.rectangle(frame, (0,0), (340, 200), (50,50,50), 2)
 
     cv2.putText(frame, predicted,
-               (10,55), cv2.FONT_HERSHEY_SIMPLEX,
+               (10, 55), cv2.FONT_HERSHEY_SIMPLEX,
                1.5, (0,255,0), 3)
 
     cv2.putText(frame, f"Conf: {confidence:.1f}%",
-               (10,90), cv2.FONT_HERSHEY_SIMPLEX,
+               (10, 90), cv2.FONT_HERSHEY_SIMPLEX,
                0.7, (0,255,255), 2)
 
     if top3_preds:
         cv2.putText(frame, "Top 3:",
-                   (10,115), cv2.FONT_HERSHEY_SIMPLEX,
+                   (10, 115), cv2.FONT_HERSHEY_SIMPLEX,
                    0.55, (200,200,200), 1)
         for i, (s, p) in enumerate(top3_preds):
             cv2.putText(frame, f"  {i+1}. {s} ({p:.0f}%)",
-                       (10, 135+i*20),
+                       (10, 135 + i*20),
                        cv2.FONT_HERSHEY_SIMPLEX,
                        0.5, (180,180,180), 1)
 
-    # ── Sentence-in-progress overlay ─────────────────────────
-    if sentence_words:
-        sentence_preview = " ".join(sentence_words)
-        cv2.rectangle(frame, (0, h-60), (w, h-32), (0,0,0), -1)
-        cv2.putText(frame, f"Sentence: {sentence_preview}",
-                   (10, h-40), cv2.FONT_HERSHEY_SIMPLEX,
-                   0.6, (0,255,150), 2)
+    # ── Top RIGHT — CLIP scene ────────────────────────────────
+    box_w = 280
+    cv2.rectangle(frame, (w-box_w-10, 5), (w-10, 75), (0,0,0), -1)
+    cv2.rectangle(frame, (w-box_w-10, 5), (w-10, 75), (50,50,50), 2)
 
+    cv2.putText(frame, "Scene:",
+               (w-box_w, 25), cv2.FONT_HERSHEY_SIMPLEX,
+               0.55, (200,200,200), 1)
+    cv2.putText(frame, f"{current_scene}",
+               (w-box_w, 52), cv2.FONT_HERSHEY_SIMPLEX,
+               0.8, (0,255,255), 2)
+    cv2.putText(frame, f"{scene_confidence:.1f}%",
+               (w-box_w, 70), cv2.FONT_HERSHEY_SIMPLEX,
+               0.5, (180,180,180), 1)
+
+    # ── BOTTOM — Sentence in progress ────────────────────────
+    # Shows unique words detected so far
+    # Clears after SENTENCE_PAUSE_SEC of stillness
+    if sentence_words:
+        sentence_text = "  →  ".join(sentence_words)
+
+        # Background
+        cv2.rectangle(frame, (0, h-70), (w, h-35), (0,0,40), -1)
+        cv2.rectangle(frame, (0, h-70), (w, h-35), (50,50,150), 2)
+
+        cv2.putText(frame, "Sentence:",
+                   (10, h-52), cv2.FONT_HERSHEY_SIMPLEX,
+                   0.5, (150,150,255), 1)
+
+        cv2.putText(frame, sentence_text,
+                   (10, h-38), cv2.FONT_HERSHEY_SIMPLEX,
+                   0.75, (255,255,255), 2)
+
+        # Show pause timer
+        remaining = max(0, SENTENCE_PAUSE_SEC - stillness)
+        if stillness > 0.2:
+            cv2.putText(frame, f"clears in {remaining:.1f}s",
+                       (w-160, h-52), cv2.FONT_HERSHEY_SIMPLEX,
+                       0.45, (150,150,150), 1)
+
+    # ── BOTTOM status bar ─────────────────────────────────────
     hand_color = (0,255,0) if hand_detected else (0,0,255)
     cv2.putText(frame,
-               f"Hand:{'ON' if hand_detected else 'OFF'} | Buf:{len(buffer)}/{MAX_FRAMES}",
+               f"Hand:{'ON' if hand_detected else 'OFF'} | "
+               f"Buf:{len(buffer)}/{MAX_FRAMES} | "
+               f"Words:{len(sentence_words)}",
                (10, h-10),
                cv2.FONT_HERSHEY_SIMPLEX,
-               0.55, hand_color, 1)
+               0.5, hand_color, 1)
 
-    # ── Sliding window progress bar ─────────────────────────
-    bar_x, bar_y   = 10, h - 30
-    bar_w, bar_h   = 200, 12
-    fill_ratio = min(len(buffer) / MAX_FRAMES, 1.0)
-    fill_w     = int(bar_w * fill_ratio)
+    # ── Sliding window progress bar ───────────────────────────
+    bar_x, bar_y = 10, h-28
+    bar_w, bar_h = 220, 10
+    fill_ratio   = min(len(buffer) / MAX_FRAMES, 1.0)
+    fill_w       = int(bar_w * fill_ratio)
 
-    # zone markers: below MIN_FRAMES = red-ish, MIN..MAX = growing (yellow->green)
     if len(buffer) < MIN_FRAMES:
-        bar_color = (0, 0, 200)       # not enough context yet
-    elif confidence / 100.0 >= get_dynamic_threshold(len(buffer), MIN_FRAMES, MAX_FRAMES):
-        bar_color = (0, 220, 0)       # confident, about to commit
+        bar_color = (0, 0, 200)
+    elif confidence / 100.0 >= get_dynamic_threshold(len(buffer)):
+        bar_color = (0, 220, 0)
     else:
-        bar_color = (0, 200, 220)     # growing, waiting for confidence
+        bar_color = (0, 200, 220)
 
-    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (60,60,60), -1)
-    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + fill_w, bar_y + bar_h), bar_color, -1)
-    cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (150,150,150), 1)
+    cv2.rectangle(frame, (bar_x, bar_y),
+                 (bar_x+bar_w, bar_y+bar_h), (60,60,60), -1)
+    cv2.rectangle(frame, (bar_x, bar_y),
+                 (bar_x+fill_w, bar_y+bar_h), bar_color, -1)
+    cv2.rectangle(frame, (bar_x, bar_y),
+                 (bar_x+bar_w, bar_y+bar_h), (150,150,150), 1)
 
-    cv2.imshow("NSL Sign Recognition v2 — Q:quit SPACE:reset", frame)
+    cv2.imshow("NSL Sign Recognition — Q:quit  SPACE:reset", frame)
 
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q'):
         if sentence_words:
-            log_sentence(sentence_words)   # flush unfinished sentence on quit
-            sentence_words = []
+            log_sentence(sentence_words)
         break
     elif key == ord(' '):
         buffer.clear()
         pred_history.clear()
-        predicted  = "Show a sign..."
-        confidence = 0.0
-        top3_preds = []
+        sentence_words  = []
+        last_committed  = None
+        predicted       = "Show a sign..."
+        confidence      = 0.0
+        top3_preds      = []
+        sentence_finalized = False
         print("🔄 Reset!")
 
+# ── Cleanup ───────────────────────────────────────────────────
 cap.release()
 cv2.destroyAllWindows()
 hand_landmarker.close()
